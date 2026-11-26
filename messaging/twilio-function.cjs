@@ -5,8 +5,24 @@ const replies = {
   "REVIEW": "Sample data • You had £390 left after spending last month. Spending was £120 above your six-month average. Housing and bills were your biggest category. Food and dining were £70 above their previous five-month average. Try a £350 food and dining target next month. Matching it would free £40 at last month’s spending level."
 }
 
-const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 2 })
-const amountPattern = String.raw`(?:£\s*)?(\d{1,8}(?:\.\d{1,2})?)(?![\d.]|,\d)`
+const currencies = new Set(Intl.supportedValuesOf('currency'))
+
+function currencyFor(text, sample) {
+  const codes = new Set([...text.matchAll(/\bcurrency\s+([a-z]{3})\b/gi)].map((match) => match[1].toUpperCase()))
+  for (const [code] of text.matchAll(/\b[A-Z]{3}\b/g)) {
+    if (currencies.has(code)) codes.add(code)
+  }
+  if (text.includes('£')) codes.add('GBP')
+  if (text.includes('€')) codes.add('EUR')
+  if (codes.size > 1) return { error: 'Use one currency for all figures in this check.' }
+  const code = [...codes][0] ?? (sample ? 'GBP' : null)
+  if (!code || !currencies.has(code)) return { error: 'Add a currency code, for example “currency CHF” or “currency USD”.' }
+  if (/[$¥₹]/.test(text)) return { error: 'Use a currency code and enter the amounts without currency symbols.' }
+  if (sample && code !== 'GBP') return { error: 'The example uses GBP. For another currency, enter your own amounts.' }
+  const format = new Intl.NumberFormat('en', { style: 'currency', currency: code, currencyDisplay: 'code' })
+  return { digits: format.resolvedOptions().maximumFractionDigits, money: (minor) => format.format(minor / 10000) }
+}
+const amountPattern = String.raw`(?:[£€]\s*)?(\d{1,8}(?:\.\d{1,4})?)(?![\d.]|,\d)`
 const leaseFields = [
   ['monthly', 'monthly payment', 'monthly'],
   ['upfront', 'upfront payment', 'upfront'],
@@ -16,18 +32,15 @@ const leaseFields = [
   ['buffer', 'cash you want to keep aside', 'buffer'],
 ]
 
-function findAmount(text, label) {
+function findAmount(text, label, digits) {
   const match = text.match(new RegExp(String.raw`\b${label}\s*[:=]?\s*${amountPattern}`, 'i'))
   if (!match) return null
   const [whole, decimals = ''] = match[1].split('.')
-  return Number(whole) * 100 + Number(decimals.padEnd(2, '0'))
+  if (decimals.length > digits) return null
+  return Number(whole) * 10000 + Number(decimals.padEnd(4, '0'))
 }
 
-function money(pence) {
-  return gbp.format(pence / 100)
-}
-
-function leaseReply({ monthly, upfront, running, spare, cash, buffer }, source) {
+function leaseReply({ monthly, upfront, running, spare, cash, buffer }, source, money) {
   const monthlyCost = monthly + running
   const monthlyLeft = spare - monthlyCost
   const cashLeft = cash - upfront
@@ -48,9 +61,12 @@ function replyTo(body) {
   const sample = /^(?:sample|demo)\s+lease\b/i.test(text)
   const labels = leaseFields.map(([, label, key]) => `${key} (${label})`).join(', ')
   if (/\b(?:cash buffer|cash reserve)\b/i.test(text) && !/^(?:(?:sample|demo)\s+)?lease\b/i.test(text)) {
-    const cash = findAmount(text, 'cash')
-    const upfront = findAmount(text, 'upfront')
-    const buffer = findAmount(text, 'buffer')
+    if (!/\d/.test(text)) return 'A cash buffer is money you plan to keep for surprises.'
+    const { error, digits, money } = currencyFor(text, false)
+    if (error) return error
+    const cash = findAmount(text, 'cash', digits)
+    const upfront = findAmount(text, 'upfront', digits)
+    const buffer = findAmount(text, 'buffer', digits)
     if (cash !== null && upfront !== null && buffer !== null) {
       const left = cash - upfront
       const difference = left - buffer
@@ -60,18 +76,19 @@ function replyTo(body) {
     return 'A cash buffer is money you plan to keep for surprises. To see what yours would look like after a purchase, send “cash buffer” with cash, upfront and buffer amounts.'
   }
   if (/\blease\b/i.test(text)) {
-    if (/[€$]|\b(?:EUR|USD|CHF)\b/i.test(text)) return 'This pilot checks leases in GBP. Send all amounts in pounds to run the comparison.'
-    const values = Object.fromEntries(leaseFields.map(([key]) => [key, findAmount(text, key)]))
+    const { error, digits, money } = currencyFor(text, sample)
+    if (error) return error
+    const values = Object.fromEntries(leaseFields.map(([key]) => [key, findAmount(text, key, digits)]))
     if (sample) {
-      const demo = { monthly: 28900, upfront: 240000, running: 19500, spare: 42000, cash: 410000, buffer: 200000 }
+      const demo = { monthly: 2890000, upfront: 24000000, running: 1950000, spare: 4200000, cash: 41000000, buffer: 20000000 }
       for (const [key] of leaseFields) if (values[key] !== null) demo[key] = values[key]
-      return leaseReply(demo, 'Sample data')
+      return leaseReply(demo, 'Sample data', money)
     }
     const missing = leaseFields.filter(([key]) => values[key] === null)
     if (missing.length) {
-      return `I need ${missing.map(([, label, key]) => `${label} (${key})`).join(', ')}. Send everything together so I can check it. Format: lease monthly 200, upfront 2400, running 195, spare 420, cash 4100, buffer 2000.`
+      return `I need ${missing.map(([, label, key]) => `${label} (${key})`).join(', ')}. Send everything together so I can check it. Use decimal points and no thousands separators. Format: lease currency EUR, monthly 200, upfront 2400, running 195, spare 420, cash 4100, buffer 2000.`
     }
-    return leaseReply(values, 'Your figures')
+    return leaseReply(values, 'Your figures', money)
   }
   return `This pilot checks how a lease fits your budget. Send LEASE for the example, “sample lease monthly 200” to change it, or “lease” with your own amounts. Use these labels: ${labels}. DINNER and REVIEW show sample checks.`
 }
