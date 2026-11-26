@@ -46,15 +46,15 @@ test('one-time flow binds bank access to the initiating browser and consumes it 
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const base = `http://127.0.0.1:${server.address().port}`
-  const start = (code = accessCode) => fetch(base + '/bank', {
+  const start = (code = accessCode, amounts = {}) => fetch(base + '/bank', {
     method: 'POST', headers: { Origin: origin }, redirect: 'manual',
-    body: new URLSearchParams({ code, purchase: '100', bills: '800', buffer: '200' }),
+    body: new URLSearchParams({ code, purchase: '100', bills: '800', buffer: '200', commitment: 'one-off', ...amounts }),
   })
   const complete = (cookie, source = origin) => fetch(base + '/bank/return?connection_id=untrusted', {
     method: 'POST', headers: { Origin: source, Cookie: cookie },
   })
-  const openFlow = async () => {
-    const response = await start()
+  const openFlow = async (amounts) => {
+    const response = await start(accessCode, amounts)
     assert.equal(response.status, 303)
     assert.match(response.headers.get('set-cookie'), /Secure; HttpOnly; SameSite=Lax/)
     return response.headers.get('set-cookie').split(';')[0]
@@ -73,6 +73,10 @@ test('one-time flow binds bank access to the initiating browser and consumes it 
   assert.equal(result.headers.get('cache-control'), 'no-store')
   assert.match(await result.text(), /£1,225.50.*£800.00.*£200.00.*£100.00.*£125.50/)
   assert.equal(calls.length, 5)
+
+  assert.equal((await start(accessCode, { commitment: 'recurring', monthlyCost: '220' })).status, 400)
+  const recurring = await complete(await openFlow({ commitment: 'recurring', monthlyCost: '220', monthlySpare: '200' }))
+  assert.match(await recurring.text(), /over budget[\s\S]*£200.00 normally left each month − £220.00 recurring cost = -£20.00 monthly headroom/)
 
   const expired = await openFlow()
   now += 601_000

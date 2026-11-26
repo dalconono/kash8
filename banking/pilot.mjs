@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import { pathToFileURL } from 'node:url'
 import trueLayer from './truelayer-sandbox.cjs'
+import { purchaseDecision } from './purchase-decision.mjs'
 
 const lifetime = 10 * 60 * 1000
 const cookie = '__Host-kash8-bank'
@@ -27,9 +28,13 @@ const restart = '<p><a href="/bank">Start a new check</a></p>'
 const startForm = `<p>Use a mock bank. Kash8 requests one-time, read-only access to account details and balances in TrueLayer’s sandbox.</p>
 <form method="post" action="/bank">
 <p><label>Pilot access code <input name="code" type="password" required autocomplete="off"></label></p>
-<p><label>Purchase in GBP <input name="purchase" inputmode="decimal" required></label></p>
-<p><label>Bills due before next income in GBP <input name="bills" inputmode="decimal" required></label></p>
+<p><label>Full upfront cost in GBP <input name="purchase" inputmode="decimal" required></label></p>
+<p><label>Bills still due before next income in GBP (exclude anything already reflected in your balance) <input name="bills" inputmode="decimal" required></label></p>
 <p><label>Cash to keep aside in GBP <input name="buffer" inputmode="decimal" required></label></p>
+<p><label>Purchase type <select name="commitment"><option value="one-off">One-off</option><option value="recurring">Recurring</option></select></label></p>
+<p>For recurring purchases, complete both monthly fields. Include any charges due before your next income in the upfront cost or bills, once.</p>
+<p><label>Total recurring cost per month in GBP <input name="monthlyCost" inputmode="decimal"></label></p>
+<p><label>Money normally left per month after bills, debt payments and savings in GBP <input name="monthlySpare" inputmode="decimal"></label></p>
 <button>Continue to bank selection</button></form>`
 
 async function form(request) {
@@ -79,6 +84,15 @@ export function createPilot({ origin, accessCode, tester, client, now = Date.now
         }
         const [purchase, bills, buffer] = ['purchase', 'bills', 'buffer'].map((field) => pence(fields.get(field)))
         if ([purchase, bills, buffer].includes(null)) return page(response, 400, '<p>Enter all three amounts in pounds and pence.</p>' + restart)
+        const commitment = fields.get('commitment')
+        const monthlyCost = pence(fields.get('monthlyCost'))
+        const spare = fields.get('monthlySpare') ?? ''
+        const monthlySpare = spare.startsWith('-') ? -(pence(spare.slice(1)) ?? NaN) : pence(spare)
+        if (!['one-off', 'recurring'].includes(commitment) ||
+            (commitment === 'recurring' && (monthlyCost === null || !Number.isSafeInteger(monthlySpare))) ||
+            (commitment === 'one-off' && (fields.get('monthlyCost') || spare))) {
+          return page(response, 400, '<p>Choose the purchase type and enter both monthly figures for a recurring purchase.</p>' + restart)
+        }
         if (flows.size + starting >= 25) return page(response, 429, '<p>The pilot is busy. Try again shortly.</p>' + restart)
         starting++
         try {
@@ -91,7 +105,7 @@ export function createPilot({ origin, accessCode, tester, client, now = Date.now
           }
           const session = randomBytes(32).toString('hex')
           flows.delete(key)
-          flows.set(session, { id: result.id, purchase, bills, buffer, expires: now() + lifetime })
+          flows.set(session, { id: result.id, purchase, bills, buffer, commitment, monthlyCost, monthlySpare, expires: now() + lifetime })
           response.writeHead(303, {
             Location: hosted.href,
             'Set-Cookie': `${cookie}=${session}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600`,
@@ -114,15 +128,23 @@ export function createPilot({ origin, accessCode, tester, client, now = Date.now
       flows.delete(key)
       response.setHeader('Set-Cookie', `${cookie}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`)
       const cash = await client.readBalance(flow.id)
-      const remaining = cash - flow.purchase - flow.bills - flow.buffer
-      if (cash === null || !Number.isSafeInteger(remaining) || Math.abs(cash) > 1e12) {
+      if (cash === null || !Number.isSafeInteger(cash) || Math.abs(cash) > 1e12) {
         return page(response, 422, '<p>This check needs exactly one GBP current account with complete balance and overdraft information.</p>' + restart)
       }
-      const verdict = remaining < 0
-        ? `You would be ${money(-remaining)} short of this plan.`
-        : `You would have ${money(remaining)} left above your cash buffer.`
+      const { status, cashHeadroom: remaining, upfrontLimit, monthlyHeadroom, monthlyLimit } = purchaseDecision({
+        ...flow, cash, price: flow.purchase,
+      })
+      const verdict = {
+        'over-budget': 'This is over budget in at least one part of your plan.',
+        'at-limit': 'This fits at the limit of your plan.',
+        fits: 'This fits the figures you entered.',
+      }[status]
+      const monthly = monthlyHeadroom === null ? '' :
+        `<p>${money(flow.monthlySpare)} normally left each month − ${money(flow.monthlyCost)} recurring cost = ${money(monthlyHeadroom)} monthly headroom.</p>
+<p>Maximum recurring cost under this plan: ${money(monthlyLimit)} per month.</p>`
       page(response, 200, `<p>${verdict}</p>
-<p>${money(cash)} sandbox balance after accounting for overdraft and pending activity − ${money(flow.bills)} bills − ${money(flow.buffer)} cash buffer − ${money(flow.purchase)} purchase = ${money(remaining)}.</p>
+<p>${money(cash)} sandbox balance after accounting for overdraft and pending activity − ${money(flow.bills)} bills − ${money(flow.buffer)} cash buffer − ${money(flow.purchase)} upfront cost = ${money(remaining)} cash headroom.</p>
+<p>Maximum upfront cost under this plan: ${money(upfrontLimit)}.</p>${monthly}
 <p>Based on one account, the bank snapshot retrieved at ${new Date(now()).toISOString()}, and the bills you entered.</p>${restart}`)
     } catch {
       page(response, 502, '<p>The sandbox check could not finish. If bank approval was cancelled, declined or expired, start again to request fresh access.</p>' + restart)
