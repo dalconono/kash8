@@ -33,8 +33,21 @@ function addExact(left, right) {
   return result
 }
 
-function spendingSummary({ period, today, accounts, records }) {
-  const window = reportingWindow(period, today)
+const groupFields = { category: 'category', merchant: 'merchant', account: 'accountId', day: 'date', month: 'date' }
+
+function spendingSummary({ period, today, range, accounts, records, filters = {}, groupBy = 'category' }) {
+  if (range && period !== undefined) throw new Error('Choose a range or a preset')
+  const window = range ? { start: range.start, endExclusive: range.endExclusive } : reportingWindow(period, today)
+  calendarDate(window.start)
+  calendarDate(window.endExclusive)
+  if (window.start >= window.endExclusive) throw new Error('Invalid reporting range')
+  if (!Object.hasOwn(groupFields, groupBy)) throw new Error('Invalid grouping')
+  const filterFields = ['category', 'merchant', 'accountId', 'currency']
+  for (const [field, value] of Object.entries(filters)) {
+    if (!filterFields.includes(field) || typeof value !== 'string' || !value.trim()) {
+      throw new Error('Invalid spending filter')
+    }
+  }
   const coverage = new Map()
   for (const account of accounts) {
     if (!account.id || coverage.has(account.id)) throw new Error('Invalid account coverage')
@@ -57,28 +70,38 @@ function spendingSummary({ period, today, accounts, records }) {
     }
     const key = JSON.stringify([item.accountId, item.id])
     const category = item.category?.trim() || 'Uncategorised'
-    const version = JSON.stringify([item.date, item.currency, item.amountMinor, item.kind, category])
+    const merchant = item.merchant?.trim() || 'Unknown merchant'
+    const version = JSON.stringify([item.date, item.currency, item.amountMinor, item.kind, category, merchant])
     if (seen.has(key)) {
       if (seen.get(key) !== version) throw new Error('Conflicting booked transaction')
       continue
     }
     seen.set(key, version)
     if (item.kind === 'transfer' || item.kind === 'income') continue
+    const details = { category, merchant, accountId: item.accountId, date: item.date, currency: item.currency }
+    if (Object.entries(filters).some(([field, value]) => {
+      return field === 'accountId'
+        ? details[field] !== value
+        : details[field].toLowerCase() !== value.trim().toLowerCase()
+    })) continue
+    const groupValue = groupBy === 'month' ? item.date.slice(0, 7) : details[groupFields[groupBy]]
 
     if (!totals.has(item.currency)) totals.set(item.currency, { spent: 0, refunded: 0, categories: new Map() })
     const group = totals.get(item.currency)
     const sign = item.kind === 'refund' ? -1 : 1
     const field = item.kind === 'refund' ? 'refunded' : 'spent'
     group[field] = addExact(group[field], item.amountMinor)
-    group.categories.set(category, addExact(group.categories.get(category) ?? 0, sign * item.amountMinor))
+    group.categories.set(groupValue, addExact(group.categories.get(groupValue) ?? 0, sign * item.amountMinor))
   }
 
   const lastDay = calendarDate(window.endExclusive)
   lastDay.setUTCDate(lastDay.getUTCDate() - 1)
+  const selectedAccounts = [...coverage.values()].filter(({ id }) => !filters.accountId || id === filters.accountId)
   return {
     ...window,
-    accountsIncluded: coverage.size,
-    complete: coverage.size > 0 && [...coverage.values()].every(
+    ...(groupBy === 'category' ? {} : { groupBy }),
+    accountsIncluded: selectedAccounts.length,
+    complete: selectedAccounts.length > 0 && selectedAccounts.every(
       ({ from, through }) => from <= window.start && through >= iso(lastDay),
     ),
     currencies: [...totals].map(([currency, group]) => ({
@@ -86,11 +109,27 @@ function spendingSummary({ period, today, accounts, records }) {
       spentMinor: group.spent,
       refundedMinor: group.refunded,
       netMinor: group.spent - group.refunded,
-      categories: [...group.categories]
+      [groupBy === 'category' ? 'categories' : 'breakdown']: [...group.categories]
         .sort((a, b) => b[1] - a[1])
-        .map(([category, netMinor]) => ({ category, netMinor })),
+        .map(([label, netMinor]) => ({ [groupBy === 'category' ? 'category' : 'label']: label, netMinor })),
     })),
   }
 }
 
-module.exports = { reportingWindow, spendingSummary }
+function compareSpending({ baseline, comparison, ...input }) {
+  const previous = spendingSummary({ ...input, range: baseline })
+  const current = spendingSummary({ ...input, range: comparison })
+  const totals = new Map(previous.currencies.map(({ currency, netMinor }) => [currency, -netMinor]))
+  for (const { currency, netMinor } of current.currencies) {
+    totals.set(currency, addExact(totals.get(currency) ?? 0, netMinor))
+  }
+  return {
+    previous,
+    current,
+    changes: previous.complete && current.complete
+      ? [...totals].map(([currency, changeMinor]) => ({ currency, changeMinor }))
+      : null,
+  }
+}
+
+module.exports = { reportingWindow, spendingSummary, compareSpending }
